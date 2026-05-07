@@ -7,10 +7,6 @@ const { serviceSchema } = require("../validators/cms.validator");
 const { cleanHtml, cleanText } = require("../utils/sanitize");
 const createAuditLog = require("../utils/auditLog");
 const { canManageContent, canDeleteContent } = require("../middleware/permission");
-const {
-  canManageContent,
-  canDeleteContent,
-} = require("../middleware/permission");
 
 const router = express.Router();
 
