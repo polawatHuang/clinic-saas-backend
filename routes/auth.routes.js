@@ -1,9 +1,11 @@
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 const pool = require("../config/db");
 const { auth } = require("../middleware/auth");
 const createLoginLog = require("../utils/loginLog");
+const { sendPasswordResetEmail } = require("../utils/mailer");
 const {
   generateAccessToken,
   generateRefreshToken,
@@ -328,6 +330,131 @@ router.get("/me", auth, async (req, res, next) => {
       success: true,
       user: rows[0],
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/auth/forgot-password
+router.post("/forgot-password", async (req, res, next) => {
+  try {
+    const { email } = req.body;
+    const ip = req.ip;
+
+    if (!email || typeof email !== "string") {
+      return res.status(400).json({ success: false, message: "Email is required" });
+    }
+
+    // Always respond 200 to prevent email enumeration
+    const SAFE_RESPONSE = res.json.bind(res, {
+      success: true,
+      message: "If that email exists, a reset link has been sent.",
+    });
+
+    const [rows] = await pool.query(
+      `SELECT id, name, email, status FROM users WHERE email = ? LIMIT 1`,
+      [email.toLowerCase().trim()],
+    );
+
+    if (!rows.length || rows[0].status !== "active") {
+      return SAFE_RESPONSE();
+    }
+
+    const user = rows[0];
+
+    // Invalidate any existing unused tokens for this user
+    await pool.query(
+      `UPDATE password_reset_tokens
+       SET used_at = NOW()
+       WHERE user_id = ? AND used_at IS NULL AND expires_at > NOW()`,
+      [user.id],
+    );
+
+    // Generate a secure random token
+    const rawToken = crypto.randomBytes(32).toString("hex");
+    const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    await pool.query(
+      `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at, created_ip)
+       VALUES (?, ?, ?, ?)`,
+      [user.id, tokenHash, expiresAt, ip],
+    );
+
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
+    const resetUrl = `${frontendUrl}/admin/reset-password?token=${rawToken}`;
+
+    await sendPasswordResetEmail({ to: user.email, name: user.name, resetUrl });
+
+    return SAFE_RESPONSE();
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/auth/reset-password
+router.post("/reset-password", async (req, res, next) => {
+  try {
+    const { token, password } = req.body;
+
+    if (!token || !password) {
+      return res.status(400).json({ success: false, message: "Token and password are required" });
+    }
+
+    if (typeof password !== "string" || password.length < 8) {
+      return res.status(400).json({ success: false, message: "Password must be at least 8 characters" });
+    }
+
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+
+    const [rows] = await pool.query(
+      `SELECT prt.id, prt.user_id, prt.expires_at, prt.used_at,
+              u.status
+       FROM password_reset_tokens prt
+       JOIN users u ON u.id = prt.user_id
+       WHERE prt.token_hash = ?
+       LIMIT 1`,
+      [tokenHash],
+    );
+
+    if (!rows.length) {
+      return res.status(400).json({ success: false, message: "Invalid or expired reset link" });
+    }
+
+    const record = rows[0];
+
+    if (record.used_at) {
+      return res.status(400).json({ success: false, message: "This reset link has already been used" });
+    }
+
+    if (new Date(record.expires_at) < new Date()) {
+      return res.status(400).json({ success: false, message: "Reset link has expired. Please request a new one." });
+    }
+
+    if (record.status !== "active") {
+      return res.status(403).json({ success: false, message: "User account is inactive" });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 12);
+
+    await pool.query(
+      `UPDATE users SET password_hash = ?, failed_login_count = 0, locked_until = NULL WHERE id = ?`,
+      [passwordHash, record.user_id],
+    );
+
+    // Mark token as used
+    await pool.query(
+      `UPDATE password_reset_tokens SET used_at = NOW() WHERE id = ?`,
+      [record.id],
+    );
+
+    // Revoke all refresh tokens for security
+    await pool.query(
+      `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = ? AND revoked_at IS NULL`,
+      [record.user_id],
+    );
+
+    res.json({ success: true, message: "Password has been reset successfully" });
   } catch (error) {
     next(error);
   }
